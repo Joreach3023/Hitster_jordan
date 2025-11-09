@@ -50,6 +50,7 @@ let reduceMotionEnabled = reduceMotionQuery ? reduceMotionQuery.matches : false;
 const statusEl = document.getElementById('status');
 const loginBtn = document.getElementById('loginBtn');
 const playBtn = document.getElementById('playBtn');
+const pauseBtn = document.getElementById('pauseBtn');
 const revealBtn = document.getElementById('revealBtn');
 const nextBtn = document.getElementById('nextBtn');
 const timerEl = document.getElementById('timer');
@@ -385,6 +386,9 @@ async function updateMediaSessionState(state) {
     }
   }
   if (!state) {
+    if (pauseBtn) {
+      pauseBtn.disabled = true;
+    }
     releaseWakeLock();
     updateVibeFromState(null);
     setVibeActive(false);
@@ -416,10 +420,17 @@ async function updateMediaSessionState(state) {
   }
 
   updateVibeFromState(state);
+  if (pauseBtn) {
+    pauseBtn.disabled = Boolean(state.paused);
+  }
   if (state.paused) {
+    stopCountdown({ reset: false });
     releaseWakeLock();
     setVibeActive(false);
   } else {
+    if (!timerHandle && !fullTrackMode) {
+      beginCountdown({ reset: false });
+    }
     ensureWakeLock().catch(() => {});
     setVibeActive(true);
   }
@@ -512,6 +523,32 @@ async function resolveFromId(id) {
   return null;
 }
 
+async function pauseCurrentPlayback() {
+  if (player && typeof player.pause === 'function') {
+    await player.pause();
+    return;
+  }
+  if (deviceId && accessToken) {
+    const res = await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${deviceId}`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer ' + accessToken }
+    });
+    if (!res?.ok) {
+      throw new Error('Pause Spotify impossible');
+    }
+    return;
+  }
+  throw new Error('Lecteur Spotify indisponible');
+}
+
+async function handlePauseRequest() {
+  await pauseCurrentPlayback();
+  stopCountdown({ reset: false });
+  setStatus('Lecture en pause.');
+  releaseWakeLock();
+  setVibeActive(false);
+}
+
 function stopCountdown({ reset = true } = {}) {
   if (timerHandle) {
     clearInterval(timerHandle);
@@ -523,9 +560,13 @@ function stopCountdown({ reset = true } = {}) {
   syncTimerDisplay();
 }
 
-function beginCountdown() {
-  stopCountdown();
+function beginCountdown({ reset = true } = {}) {
+  stopCountdown({ reset: false });
+  if (reset || !Number.isFinite(countdown) || countdown <= 0) {
+    countdown = TIMER_DURATION;
+  }
   if (fullTrackMode) {
+    syncTimerDisplay();
     return;
   }
   timerHandle = setInterval(async () => {
@@ -536,14 +577,7 @@ function beginCountdown() {
       timerHandle = null;
       syncTimerDisplay();
       try {
-        if (player && typeof player.pause === 'function') {
-          await player.pause();
-        } else if (deviceId && accessToken) {
-          await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${deviceId}`, {
-            method: 'PUT',
-            headers: { Authorization: 'Bearer ' + accessToken }
-          });
-        }
+        await pauseCurrentPlayback();
       } catch (err) {
         console.error('Failed to pause after countdown', err);
       }
@@ -1041,6 +1075,17 @@ playBtn.addEventListener('click', () => {
     .catch(() => {})
     .then(() => runPlaybackSequence());
   playbackQueue.catch(() => {});
+});
+
+pauseBtn?.addEventListener('click', () => {
+  Promise.resolve(handlePauseRequest()).catch(err => {
+    console.error('Pause button failed', err);
+    if (err && err.message) {
+      setStatus('Pause impossible: ' + err.message);
+    } else {
+      setStatus('Pause impossible.');
+    }
+  });
 });
 
 fullTrackToggle?.addEventListener('change', () => {
