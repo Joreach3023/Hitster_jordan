@@ -17,6 +17,7 @@ async function runScenario({ activationShouldFail = false, playClicks = 1, devic
       <div id="status"></div>
       <button id="loginBtn"></button>
       <button id="playBtn"></button>
+      <button id="pauseBtn"></button>
       <button id="revealBtn"></button>
       <button id="nextBtn"></button>
       <div id="timer"></div>
@@ -132,6 +133,7 @@ async function runScenario({ activationShouldFail = false, playClicks = 1, devic
 
   const statusText = document.getElementById('status').textContent;
   const timerText = document.getElementById('timer').textContent;
+  const pauseDisabled = document.getElementById('pauseBtn').disabled;
 
   activeIntervals.forEach(id => clearInterval(id));
 
@@ -140,6 +142,7 @@ async function runScenario({ activationShouldFail = false, playClicks = 1, devic
     fetchCalls,
     statusText,
     timerText,
+    pauseDisabled,
   };
 }
 
@@ -154,12 +157,14 @@ async function runScenario({ activationShouldFail = false, playClicks = 1, devic
   assert.strictEqual(success.fetchCalls[4].url, 'https://api.spotify.com/v1/me/player/play?device_id=device123');
   assert.strictEqual(success.statusText, 'Playing...');
   assert.strictEqual(success.timerText, '30');
+  assert.strictEqual(success.pauseDisabled, false, 'pause button should be enabled after successful playback');
 
   const failure = await runScenario({ activationShouldFail: true, playClicks: 1 });
   assert.strictEqual(failure.activateCalls, 1, 'activateElement should be attempted once');
   assert.strictEqual(failure.fetchCalls.length, 1, 'only device discovery should be attempted when activation fails');
   assert.strictEqual(failure.fetchCalls[0].url, 'https://api.spotify.com/v1/me/player/devices');
   assert.strictEqual(failure.statusText, 'Tap allow audio to enable playback on this device.');
+  assert.strictEqual(failure.pauseDisabled, true, 'pause button should remain disabled when activation fails');
 
   const remote = await runScenario({
     activationShouldFail: false,
@@ -171,6 +176,7 @@ async function runScenario({ activationShouldFail = false, playClicks = 1, devic
   assert.strictEqual(remote.fetchCalls[0].url, 'https://api.spotify.com/v1/me/player/devices');
   assert.strictEqual(remote.fetchCalls[1].url, 'https://api.spotify.com/v1/me/player/play?device_id=speaker123');
   assert.strictEqual(remote.statusText, 'Playing...');
+  assert.strictEqual(remote.pauseDisabled, false, 'pause button should be enabled for remote playback');
 
   console.log('All tests passed');
 })().catch(err => {

@@ -51,6 +51,7 @@ let reduceMotionEnabled = reduceMotionQuery ? reduceMotionQuery.matches : false;
 const statusEl = document.getElementById('status');
 const loginBtn = document.getElementById('loginBtn');
 const playBtn = document.getElementById('playBtn');
+const pauseBtn = document.getElementById('pauseBtn');
 const revealBtn = document.getElementById('revealBtn');
 const nextBtn = document.getElementById('nextBtn');
 const timerEl = document.getElementById('timer');
@@ -82,6 +83,7 @@ let mediaStream = null;
 let scanRunning = false;
 let scanLoopHandle = null;
 let scannerInactivityTimer = null;
+let scannerStreamPromise = null;
 
 // ------- Helpers -------
 function setStatus(msg) {
@@ -412,6 +414,9 @@ async function updateMediaSessionState(state) {
     }
   }
   if (!state) {
+    if (pauseBtn) {
+      pauseBtn.disabled = true;
+    }
     releaseWakeLock();
     updateVibeFromState(null);
     setVibeActive(false);
@@ -443,10 +448,17 @@ async function updateMediaSessionState(state) {
   }
 
   updateVibeFromState(state);
+  if (pauseBtn) {
+    pauseBtn.disabled = Boolean(state.paused);
+  }
   if (state.paused) {
+    stopCountdown({ reset: false });
     releaseWakeLock();
     setVibeActive(false);
   } else {
+    if (!timerHandle && !fullTrackMode) {
+      beginCountdown({ reset: false });
+    }
     ensureWakeLock().catch(() => {});
     setVibeActive(true);
   }
@@ -539,6 +551,48 @@ async function resolveFromId(id) {
   return null;
 }
 
+async function pauseCurrentPlayback() {
+  const targetDeviceId = lastPlaybackDeviceId || deviceId;
+
+  if (targetDeviceId === deviceId && player && typeof player.pause === 'function') {
+    try {
+      await player.pause();
+      return;
+    } catch (err) {
+      console.warn('Spotify SDK pause failed, falling back to Web API', err);
+    }
+  }
+
+  if (targetDeviceId && accessToken) {
+    const res = await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${targetDeviceId}`, {
+      method: 'PUT',
+      headers: { Authorization: 'Bearer ' + accessToken }
+    });
+    if (!res?.ok) {
+      throw new Error('Pause Spotify impossible');
+    }
+    return;
+  }
+
+  if (player && typeof player.pause === 'function') {
+    await player.pause();
+    return;
+  }
+
+  throw new Error('Lecteur Spotify indisponible');
+}
+
+async function handlePauseRequest() {
+  await pauseCurrentPlayback();
+  stopCountdown({ reset: false });
+  setStatus('Lecture en pause.');
+  if (pauseBtn) {
+    pauseBtn.disabled = true;
+  }
+  releaseWakeLock();
+  setVibeActive(false);
+}
+
 function stopCountdown({ reset = true } = {}) {
   if (timerHandle) {
     clearInterval(timerHandle);
@@ -550,9 +604,13 @@ function stopCountdown({ reset = true } = {}) {
   syncTimerDisplay();
 }
 
-function beginCountdown() {
-  stopCountdown();
+function beginCountdown({ reset = true } = {}) {
+  stopCountdown({ reset: false });
+  if (reset || !Number.isFinite(countdown) || countdown <= 0) {
+    countdown = TIMER_DURATION;
+  }
   if (fullTrackMode) {
+    syncTimerDisplay();
     return;
   }
   timerHandle = setInterval(async () => {
@@ -563,19 +621,14 @@ function beginCountdown() {
       timerHandle = null;
       syncTimerDisplay();
       try {
-        if (player && typeof player.pause === 'function') {
-          await player.pause();
-        } else if (accessToken && (lastPlaybackDeviceId || deviceId)) {
-          const targetDeviceId = lastPlaybackDeviceId || deviceId;
-          await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${targetDeviceId}`, {
-            method: 'PUT',
-            headers: { Authorization: 'Bearer ' + accessToken }
-          });
-        }
+        await pauseCurrentPlayback();
       } catch (err) {
         console.error('Failed to pause after countdown', err);
       }
       setStatus('Stopped.');
+      if (pauseBtn) {
+        pauseBtn.disabled = true;
+      }
       releaseWakeLock();
       setVibeActive(false);
     }
@@ -746,10 +799,16 @@ async function startAfterEnsureDevice() {
     await startTrack(currentUri, targetDeviceId);
     lastPlaybackDeviceId = targetDeviceId;
     setStatus('Playing...');
+    if (pauseBtn) {
+      pauseBtn.disabled = false;
+    }
   } catch (error) {
     console.error('Playback failed', error);
     playbackTransferred = false;
     lastPlaybackDeviceId = null;
+    if (pauseBtn) {
+      pauseBtn.disabled = true;
+    }
     if (error && error.message === 'Activation blocked') {
       setStatus('Tap allow audio to enable playback on this device.');
     } else {
@@ -901,25 +960,43 @@ function scheduleScannerInactivityStop() {
   clearScannerInactivityTimer();
   scannerInactivityTimer = setTimeout(() => {
     setScannerMessage('Scanner arrêté pour économiser la batterie.');
-    stopScanner();
+    stopScanner({ release: true });
     toggleScannerPane(false);
   }, SCANNER_INACTIVITY_MS);
 }
 
-function stopScanner() {
+function stopScanner({ release = false } = {}) {
   scanRunning = false;
   if (scanLoopHandle) {
     clearTimeout(scanLoopHandle);
     scanLoopHandle = null;
   }
   clearScannerInactivityTimer();
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(track => track.stop());
-    mediaStream = null;
-  }
   if (qrVideo) {
     qrVideo.pause();
-    qrVideo.srcObject = null;
+    if (release) {
+      qrVideo.srcObject = null;
+    }
+  }
+  if (mediaStream) {
+    const videoTracks = mediaStream.getVideoTracks();
+    videoTracks.forEach(track => {
+      if (release) {
+        try {
+          track.stop();
+        } catch (err) {
+          // Ignore stop errors
+        }
+      } else {
+        track.enabled = false;
+      }
+    });
+    if (release) {
+      mediaStream = null;
+      scannerStreamPromise = null;
+    }
+  } else if (release) {
+    scannerStreamPromise = null;
   }
 }
 
@@ -1102,6 +1179,17 @@ playBtn.addEventListener('click', () => {
   playbackQueue.catch(() => {});
 });
 
+pauseBtn?.addEventListener('click', () => {
+  Promise.resolve(handlePauseRequest()).catch(err => {
+    console.error('Pause button failed', err);
+    if (err && err.message) {
+      setStatus('Pause impossible: ' + err.message);
+    } else {
+      setStatus('Pause impossible.');
+    }
+  });
+});
+
 fullTrackToggle?.addEventListener('change', () => {
   setFullTrackMode(fullTrackToggle.checked, { persist: true });
 });
@@ -1218,6 +1306,53 @@ nextBtn.addEventListener('click', () => {
 });
 
 // ------- Scanner controls -------
+async function requestScannerStream() {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    throw new Error('mediaDevices.getUserMedia not available');
+  }
+  if (mediaStream && !mediaStream.active) {
+    mediaStream = null;
+    scannerStreamPromise = null;
+  }
+  if (mediaStream && mediaStream.active) {
+    return mediaStream;
+  }
+  if (scannerStreamPromise) {
+    return scannerStreamPromise;
+  }
+  const constraints = {
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    },
+    audio: false
+  };
+  scannerStreamPromise = navigator.mediaDevices
+    .getUserMedia(constraints)
+    .then(stream => {
+      mediaStream = stream;
+      stream.getTracks().forEach(track => {
+        track.addEventListener(
+          'ended',
+          () => {
+            if (mediaStream === stream && track.readyState === 'ended') {
+              mediaStream = null;
+              scannerStreamPromise = null;
+            }
+          },
+          { once: true }
+        );
+      });
+      return stream;
+    })
+    .catch(err => {
+      scannerStreamPromise = null;
+      throw err;
+    });
+  return scannerStreamPromise;
+}
+
 openScannerBtn?.addEventListener('click', async () => {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setScannerMessage('Caméra indisponible sur cet appareil.');
@@ -1230,16 +1365,14 @@ openScannerBtn?.addEventListener('click', async () => {
   toggleScannerPane(true);
   try {
     setScannerMessage('Ouverture de la caméra…');
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      },
-      audio: false
+    const stream = await requestScannerStream();
+    stream.getVideoTracks().forEach(track => {
+      track.enabled = true;
     });
-    qrVideo.srcObject = mediaStream;
-    await qrVideo.play();
+    if (qrVideo) {
+      qrVideo.srcObject = stream;
+      await qrVideo.play();
+    }
     scanRunning = true;
     scheduleScannerInactivityStop();
     setScannerMessage('Scanne un QR…');
@@ -1247,7 +1380,7 @@ openScannerBtn?.addEventListener('click', async () => {
   } catch (err) {
     console.error('Unable to open camera', err);
     setScannerMessage('Permission caméra refusée ou indisponible.');
-    stopScanner();
+    stopScanner({ release: true });
     toggleScannerPane(false);
   }
 });
@@ -1257,3 +1390,11 @@ closeScannerBtn?.addEventListener('click', () => {
   toggleScannerPane(false);
   setScannerMessage('Caméra fermée');
 });
+
+if (typeof window !== 'undefined') {
+  const releaseCamera = () => {
+    stopScanner({ release: true });
+  };
+  window.addEventListener('pagehide', releaseCamera);
+  window.addEventListener('beforeunload', releaseCamera);
+}
