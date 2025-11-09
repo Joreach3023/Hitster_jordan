@@ -11,6 +11,7 @@ const SCAN_READY_MESSAGE = 'Musique prête. Appuie sur Play pour lancer !';
 // ------- State -------
 let accessToken = null;
 let deviceId = null;
+let sdkDeviceId = null;
 let player = null;
 let playerActivated = false;
 let currentUri = null;
@@ -525,7 +526,7 @@ async function resolveFromId(id) {
 }
 
 async function pauseCurrentPlayback() {
-  if (player && typeof player.pause === 'function') {
+  if (player && typeof player.pause === 'function' && deviceId === sdkDeviceId) {
     await player.pause();
     return;
   }
@@ -650,10 +651,72 @@ function restoreFullTrackMode() {
   setFullTrackMode(preferred);
 }
 
-async function transferPlaybackToSdk({ force = false } = {}) {
-  if (!accessToken || !deviceId) {
+async function fetchPlayerDevices() {
+  if (!accessToken) {
     throw new Error('Login and wait for player ready.');
   }
+  const res = await fetch('https://api.spotify.com/v1/me/player/devices', {
+    headers: {
+      Authorization: 'Bearer ' + accessToken,
+      'Content-Type': 'application/json'
+    }
+  });
+  if (res && res.ok === false) {
+    throw new Error('Impossible de récupérer les appareils Spotify (' + res.status + ')');
+  }
+  try {
+    const payload = await res.json();
+    if (payload && Array.isArray(payload.devices)) {
+      return payload.devices;
+    }
+  } catch (err) {
+    console.warn('Unable to parse Spotify device payload', err);
+  }
+  return [];
+}
+
+async function ensurePreferredPlaybackDevice() {
+  const devices = await fetchPlayerDevices();
+  const activeDevice = devices.find(device => device && device.is_active && device.id);
+  if (activeDevice && (!sdkDeviceId || activeDevice.id !== sdkDeviceId)) {
+    deviceId = activeDevice.id;
+    playbackTransferred = false;
+    return { usingSdkDevice: false, device: activeDevice };
+  }
+
+  if (sdkDeviceId) {
+    deviceId = sdkDeviceId;
+    const sdkDevice = devices.find(device => device && device.id === sdkDeviceId) || null;
+    return { usingSdkDevice: true, device: sdkDevice || activeDevice || null };
+  }
+
+  if (activeDevice) {
+    deviceId = activeDevice.id;
+    playbackTransferred = false;
+    return { usingSdkDevice: false, device: activeDevice };
+  }
+
+  const fallback = devices.find(device => device && device.id);
+  if (fallback) {
+    deviceId = fallback.id;
+    const usingSdkDevice = Boolean(sdkDeviceId && fallback.id === sdkDeviceId);
+    if (!usingSdkDevice) {
+      playbackTransferred = false;
+    }
+    return { usingSdkDevice, device: fallback };
+  }
+
+  throw new Error('Aucun appareil Spotify disponible. Lance l’app Spotify et sélectionne un appareil.');
+}
+
+async function transferPlaybackToSdk({ force = false } = {}) {
+  if (!accessToken) {
+    throw new Error('Login and wait for player ready.');
+  }
+  if (!sdkDeviceId) {
+    throw new Error('Lecteur Spotify indisponible.');
+  }
+  deviceId = sdkDeviceId;
   if (playbackTransferred && !force) {
     return;
   }
@@ -698,7 +761,7 @@ async function startTrack(uri) {
 }
 
 async function startAfterEnsureDevice() {
-  if (!accessToken || !deviceId) {
+  if (!accessToken) {
     const err = new Error('Login and wait for player ready.');
     setStatus(err.message);
     throw err;
@@ -710,17 +773,21 @@ async function startAfterEnsureDevice() {
   }
 
   try {
-    if (player && typeof player.activateElement === 'function' && !playerActivated) {
-      await player.activateElement();
-      if (typeof player.setVolume === 'function') {
+    const { usingSdkDevice } = await ensurePreferredPlaybackDevice();
+
+    if (usingSdkDevice) {
+      if (player && typeof player.activateElement === 'function' && !playerActivated) {
+        await player.activateElement();
+        if (typeof player.setVolume === 'function') {
+          await player.setVolume(0.9);
+        }
+        playerActivated = true;
+      } else if (player && typeof player.setVolume === 'function') {
         await player.setVolume(0.9);
       }
-      playerActivated = true;
-    } else if (player && typeof player.setVolume === 'function') {
-      await player.setVolume(0.9);
-    }
 
-    await transferPlaybackToSdk();
+      await transferPlaybackToSdk();
+    }
     await startTrack(currentUri);
     setStatus('Playing...');
   } catch (error) {
@@ -965,12 +1032,16 @@ function attemptSetupPlayer() {
   });
 
   player.addListener('ready', ({ device_id }) => {
+    sdkDeviceId = device_id;
     deviceId = device_id;
     playbackTransferred = false;
     setStatus('Player ready. Device: ' + device_id);
   });
 
   player.addListener('not_ready', ({ device_id }) => {
+    if (sdkDeviceId === device_id) {
+      sdkDeviceId = null;
+    }
     if (deviceId === device_id) {
       deviceId = null;
       playerActivated = false;
