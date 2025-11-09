@@ -81,6 +81,7 @@ let mediaStream = null;
 let scanRunning = false;
 let scanLoopHandle = null;
 let scannerInactivityTimer = null;
+let scannerStreamPromise = null;
 
 // ------- Helpers -------
 function setStatus(msg) {
@@ -842,25 +843,43 @@ function scheduleScannerInactivityStop() {
   clearScannerInactivityTimer();
   scannerInactivityTimer = setTimeout(() => {
     setScannerMessage('Scanner arrêté pour économiser la batterie.');
-    stopScanner();
+    stopScanner({ release: true });
     toggleScannerPane(false);
   }, SCANNER_INACTIVITY_MS);
 }
 
-function stopScanner() {
+function stopScanner({ release = false } = {}) {
   scanRunning = false;
   if (scanLoopHandle) {
     clearTimeout(scanLoopHandle);
     scanLoopHandle = null;
   }
   clearScannerInactivityTimer();
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(track => track.stop());
-    mediaStream = null;
-  }
   if (qrVideo) {
     qrVideo.pause();
-    qrVideo.srcObject = null;
+    if (release) {
+      qrVideo.srcObject = null;
+    }
+  }
+  if (mediaStream) {
+    const videoTracks = mediaStream.getVideoTracks();
+    videoTracks.forEach(track => {
+      if (release) {
+        try {
+          track.stop();
+        } catch (err) {
+          // Ignore stop errors
+        }
+      } else {
+        track.enabled = false;
+      }
+    });
+    if (release) {
+      mediaStream = null;
+      scannerStreamPromise = null;
+    }
+  } else if (release) {
+    scannerStreamPromise = null;
   }
 }
 
@@ -1159,6 +1178,53 @@ nextBtn.addEventListener('click', () => {
 });
 
 // ------- Scanner controls -------
+async function requestScannerStream() {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    throw new Error('mediaDevices.getUserMedia not available');
+  }
+  if (mediaStream && !mediaStream.active) {
+    mediaStream = null;
+    scannerStreamPromise = null;
+  }
+  if (mediaStream && mediaStream.active) {
+    return mediaStream;
+  }
+  if (scannerStreamPromise) {
+    return scannerStreamPromise;
+  }
+  const constraints = {
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    },
+    audio: false
+  };
+  scannerStreamPromise = navigator.mediaDevices
+    .getUserMedia(constraints)
+    .then(stream => {
+      mediaStream = stream;
+      stream.getTracks().forEach(track => {
+        track.addEventListener(
+          'ended',
+          () => {
+            if (mediaStream === stream && track.readyState === 'ended') {
+              mediaStream = null;
+              scannerStreamPromise = null;
+            }
+          },
+          { once: true }
+        );
+      });
+      return stream;
+    })
+    .catch(err => {
+      scannerStreamPromise = null;
+      throw err;
+    });
+  return scannerStreamPromise;
+}
+
 openScannerBtn?.addEventListener('click', async () => {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setScannerMessage('Caméra indisponible sur cet appareil.');
@@ -1171,16 +1237,14 @@ openScannerBtn?.addEventListener('click', async () => {
   toggleScannerPane(true);
   try {
     setScannerMessage('Ouverture de la caméra…');
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      },
-      audio: false
+    const stream = await requestScannerStream();
+    stream.getVideoTracks().forEach(track => {
+      track.enabled = true;
     });
-    qrVideo.srcObject = mediaStream;
-    await qrVideo.play();
+    if (qrVideo) {
+      qrVideo.srcObject = stream;
+      await qrVideo.play();
+    }
     scanRunning = true;
     scheduleScannerInactivityStop();
     setScannerMessage('Scanne un QR…');
@@ -1188,7 +1252,7 @@ openScannerBtn?.addEventListener('click', async () => {
   } catch (err) {
     console.error('Unable to open camera', err);
     setScannerMessage('Permission caméra refusée ou indisponible.');
-    stopScanner();
+    stopScanner({ release: true });
     toggleScannerPane(false);
   }
 });
@@ -1198,3 +1262,11 @@ closeScannerBtn?.addEventListener('click', () => {
   toggleScannerPane(false);
   setScannerMessage('Caméra fermée');
 });
+
+if (typeof window !== 'undefined') {
+  const releaseCamera = () => {
+    stopScanner({ release: true });
+  };
+  window.addEventListener('pagehide', releaseCamera);
+  window.addEventListener('beforeunload', releaseCamera);
+}
