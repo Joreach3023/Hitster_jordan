@@ -40,6 +40,7 @@ let vibeActive = false;
 let lastMediaSessionUri = null;
 let mediaSessionHandlersBound = false;
 let playbackTransferred = false;
+let lastPlaybackDeviceId = null;
 const reduceMotionQuery =
   typeof window !== 'undefined' && typeof window.matchMedia === 'function'
     ? window.matchMedia('(prefers-reduced-motion: reduce)')
@@ -128,6 +129,32 @@ function ensureAudioContext() {
   }
   audioCtx = new Ctor();
   return audioCtx;
+}
+
+async function fetchActiveSpotifyDevice() {
+  if (!accessToken) {
+    return null;
+  }
+  try {
+    const res = await fetch('https://api.spotify.com/v1/me/player/devices', {
+      headers: { Authorization: 'Bearer ' + accessToken }
+    });
+    if (!res || res.ok === false) {
+      return null;
+    }
+    const payload = await res.json().catch(() => null);
+    const devices = payload?.devices;
+    if (!Array.isArray(devices)) {
+      return null;
+    }
+    const active = devices.find(device => device && device.is_active);
+    if (active && active.id) {
+      return active;
+    }
+  } catch (err) {
+    console.warn('Unable to query Spotify devices', err);
+  }
+  return null;
 }
 
 function playMicroSfx() {
@@ -538,8 +565,9 @@ function beginCountdown() {
       try {
         if (player && typeof player.pause === 'function') {
           await player.pause();
-        } else if (deviceId && accessToken) {
-          await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${deviceId}`, {
+        } else if (accessToken && (lastPlaybackDeviceId || deviceId)) {
+          const targetDeviceId = lastPlaybackDeviceId || deviceId;
+          await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${targetDeviceId}`, {
             method: 'PUT',
             headers: { Authorization: 'Bearer ' + accessToken }
           });
@@ -636,11 +664,15 @@ async function transferPlaybackToSdk({ force = false } = {}) {
   playbackTransferred = true;
 }
 
-async function startTrack(uri) {
+async function startTrack(uri, targetDeviceId = deviceId) {
   if (!uri) {
     throw new Error('No track URI provided.');
   }
-  const res = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+  const playbackDeviceId = targetDeviceId || deviceId;
+  if (!playbackDeviceId) {
+    throw new Error('No playback device available.');
+  }
+  const res = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${playbackDeviceId}`, {
     method: 'PUT',
     headers: {
       Authorization: 'Bearer ' + accessToken,
@@ -663,7 +695,7 @@ async function startTrack(uri) {
 }
 
 async function startAfterEnsureDevice() {
-  if (!accessToken || !deviceId) {
+  if (!accessToken) {
     const err = new Error('Login and wait for player ready.');
     setStatus(err.message);
     throw err;
@@ -674,23 +706,50 @@ async function startAfterEnsureDevice() {
     throw err;
   }
 
+  let activeDevice = null;
   try {
-    if (player && typeof player.activateElement === 'function' && !playerActivated) {
-      await player.activateElement();
-      if (typeof player.setVolume === 'function') {
+    activeDevice = await fetchActiveSpotifyDevice();
+  } catch (err) {
+    console.warn('Unable to determine active Spotify device', err);
+  }
+
+  let targetDeviceId = deviceId;
+  let usingSdkDevice = Boolean(deviceId);
+  if (activeDevice && activeDevice.id) {
+    targetDeviceId = activeDevice.id;
+    usingSdkDevice = activeDevice.id === deviceId;
+  }
+
+  if (!targetDeviceId) {
+    const err = new Error('No Spotify playback device available.');
+    setStatus(err.message);
+    throw err;
+  }
+
+  try {
+    if (usingSdkDevice) {
+      if (player && typeof player.activateElement === 'function' && !playerActivated) {
+        await player.activateElement();
+        if (typeof player.setVolume === 'function') {
+          await player.setVolume(0.9);
+        }
+        playerActivated = true;
+      } else if (player && typeof player.setVolume === 'function') {
         await player.setVolume(0.9);
       }
-      playerActivated = true;
-    } else if (player && typeof player.setVolume === 'function') {
-      await player.setVolume(0.9);
+
+      await transferPlaybackToSdk();
+    } else {
+      playbackTransferred = false;
     }
 
-    await transferPlaybackToSdk();
-    await startTrack(currentUri);
+    await startTrack(currentUri, targetDeviceId);
+    lastPlaybackDeviceId = targetDeviceId;
     setStatus('Playing...');
   } catch (error) {
     console.error('Playback failed', error);
     playbackTransferred = false;
+    lastPlaybackDeviceId = null;
     if (error && error.message === 'Activation blocked') {
       setStatus('Tap allow audio to enable playback on this device.');
     } else {
